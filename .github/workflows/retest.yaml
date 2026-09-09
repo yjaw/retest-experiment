@@ -1,0 +1,167 @@
+name: Retest command
+
+# Re-run failed CI on a pull request by commenting:
+#   /retest       -> re-run only failed runs (GitHub Actions failed jobs + Buildkite rebuild)
+#   /retest-all    -> re-run every run (all GitHub Actions jobs + fresh Buildkite build)
+#
+# NOTE: issue_comment workflows only execute from the copy of this file on the
+# repository's DEFAULT branch. Push this to `main` first, then test from PRs.
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  actions: write        # rerun workflow runs / failed jobs
+  contents: read
+  pull-requests: write  # react to the comment and post a summary
+
+concurrency:
+  group: retest-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  retest:
+    name: Handle /retest
+    runs-on: ubuntu-22.04
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/retest')
+    steps:
+      - name: Process retest command
+        uses: actions/github-script@v7
+        env:
+          # Who may run /retest. Comma separated: "author" (PR author),
+          # "write" (write/maintain/admin permission). Policy TBD with maintainers.
+          ALLOWED: "author,write"
+          # Buildkite: the Buildkite half no-ops when BUILDKITE_API_TOKEN is unset.
+          BUILDKITE_API_TOKEN: ${{ secrets.BUILDKITE_API_TOKEN }}
+          BUILDKITE_ORG: ${{ vars.BUILDKITE_ORG }}
+          BUILDKITE_PIPELINE: ${{ vars.BUILDKITE_PIPELINE }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issueNumber = context.payload.issue.number;
+            const commenter = context.payload.comment.user.login;
+            const body = (context.payload.comment.body || '').trim();
+
+            // ----- parse command (must be on its own line) -----
+            const cmdLine = body.split('\n').map(l => l.trim()).find(l => l.startsWith('/retest'));
+            const validCommands = ['/retest', '/retest-all'];
+            if (!validCommands.includes(cmdLine)) {
+              core.info(`No valid retest command (got: ${JSON.stringify(cmdLine)}), exiting.`);
+              return;
+            }
+            const retestAll = cmdLine === '/retest-all';
+
+            const react = (content) => github.rest.reactions.createForIssueComment({
+              owner, repo, comment_id: context.payload.comment.id, content,
+            }).catch(e => core.warning(`reaction failed: ${e.message}`));
+
+            // ----- permission check -----
+            const allowed = (process.env.ALLOWED || '').split(',').map(s => s.trim()).filter(Boolean);
+            const pr = (await github.rest.pulls.get({ owner, repo, pull_number: issueNumber })).data;
+
+            let permitted = allowed.includes('author') && pr.user.login === commenter;
+            if (!permitted && allowed.includes('write')) {
+              try {
+                const perm = (await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner, repo, username: commenter,
+                })).data.permission;
+                permitted = ['admin', 'write', 'maintain'].includes(perm);
+              } catch (e) {
+                core.info(`permission lookup failed for ${commenter}: ${e.message}`);
+              }
+            }
+            if (!permitted) {
+              await react('confused');
+              core.setFailed(`@${commenter} is not permitted to run ${cmdLine} (allowed: ${allowed.join(', ')}).`);
+              return;
+            }
+            await react('rocket');
+
+            const headSha = pr.head.sha;
+            const headRef = pr.head.ref;
+            const summary = [];
+
+            // ===== GitHub Actions: latest run per workflow for the PR head commit =====
+            const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
+              owner, repo, head_sha: headSha, per_page: 100,
+            });
+            const latestByWorkflow = new Map();
+            for (const run of runs) {
+              if (run.name === context.workflow) continue; // don't re-run ourselves
+              const prev = latestByWorkflow.get(run.workflow_id);
+              if (!prev || run.run_number > prev.run_number) latestByWorkflow.set(run.workflow_id, run);
+            }
+
+            const failedConclusions = ['failure', 'cancelled', 'timed_out', 'startup_failure', 'stale', 'action_required'];
+            for (const run of latestByWorkflow.values()) {
+              const isFailed = failedConclusions.includes(run.conclusion);
+              if (!retestAll && !isFailed) {
+                summary.push(`- GHA \`${run.name}\`: skipped (conclusion: ${run.conclusion})`);
+                continue;
+              }
+              try {
+                if (retestAll) {
+                  await github.rest.actions.reRunWorkflow({ owner, repo, run_id: run.id });
+                  summary.push(`- GHA \`${run.name}\`: re-running all jobs`);
+                } else {
+                  await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: run.id });
+                  summary.push(`- GHA \`${run.name}\`: re-running failed jobs`);
+                }
+              } catch (e) {
+                summary.push(`- GHA \`${run.name}\`: failed to trigger (${e.message})`);
+              }
+            }
+            if (latestByWorkflow.size === 0) {
+              summary.push('- GHA: no workflow runs found for the PR head commit');
+            }
+
+            // ===== Buildkite =====
+            const bkToken = process.env.BUILDKITE_API_TOKEN;
+            const bkOrg = process.env.BUILDKITE_ORG;
+            const bkPipeline = process.env.BUILDKITE_PIPELINE;
+            if (!bkToken || !bkOrg || !bkPipeline) {
+              summary.push('- Buildkite: skipped (BUILDKITE_API_TOKEN / BUILDKITE_ORG / BUILDKITE_PIPELINE not all set)');
+            } else {
+              const bkBase = `https://api.buildkite.com/v2/organizations/${bkOrg}/pipelines/${bkPipeline}`;
+              const bkHeaders = { Authorization: `Bearer ${bkToken}`, 'Content-Type': 'application/json' };
+              try {
+                const listResp = await fetch(`${bkBase}/builds?commit=${headSha}&per_page=1`, { headers: bkHeaders });
+                if (!listResp.ok) throw new Error(`list builds HTTP ${listResp.status}`);
+                const builds = await listResp.json();
+                if (retestAll || builds.length === 0) {
+                  const createResp = await fetch(`${bkBase}/builds`, {
+                    method: 'POST', headers: bkHeaders,
+                    body: JSON.stringify({
+                      commit: headSha, branch: headRef,
+                      message: `:repeat: ${cmdLine} by @${commenter} (PR #${issueNumber})`,
+                    }),
+                  });
+                  if (!createResp.ok) throw new Error(`create build HTTP ${createResp.status}: ${await createResp.text()}`);
+                  const b = await createResp.json();
+                  summary.push(`- Buildkite: started new build [#${b.number}](${b.web_url})`);
+                } else {
+                  const b = builds[0];
+                  const rebuildResp = await fetch(`${bkBase}/builds/${b.number}/rebuild`, { method: 'PUT', headers: bkHeaders });
+                  if (!rebuildResp.ok) throw new Error(`rebuild HTTP ${rebuildResp.status}: ${await rebuildResp.text()}`);
+                  const nb = await rebuildResp.json();
+                  summary.push(`- Buildkite: rebuilt [#${b.number}](${b.web_url}) -> [#${nb.number}](${nb.web_url})`);
+                }
+              } catch (e) {
+                summary.push(`- Buildkite: failed to trigger (${e.message})`);
+              }
+            }
+
+            // ===== report =====
+            const mode = retestAll ? '`/retest-all` (all runs)' : '`/retest` (failed runs only)';
+            const comment = [
+              `### Retest triggered by @${commenter}`,
+              ``,
+              `Mode: ${mode} on commit \`${headSha.slice(0, 7)}\``,
+              ``,
+              ...summary,
+            ].join('\n');
+            await github.rest.issues.createComment({ owner, repo, issue_number: issueNumber, body: comment });
+            await react('+1');

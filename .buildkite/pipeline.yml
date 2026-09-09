@@ -1,0 +1,12 @@
+steps:
+  - label: ":game_die: Flaky Buildkite step 1"
+    command: |
+      echo "retried_in_job_retries=$${BUILDKITE_RETRY_COUNT:-0}"
+      if [ $$(( RANDOM % 2 )) -eq 0 ]; then echo "PASS"; else echo "FLAKED"; exit 1; fi
+
+  - label: ":game_die: Flaky Buildkite step 2"
+    command: |
+      if [ $$(( RANDOM % 2 )) -eq 0 ]; then echo "PASS"; else echo "FLAKED"; exit 1; fi
+
+  - label: ":white_check_mark: Always green"
+    command: echo "never fails"

@@ -1,0 +1,45 @@
+name: Flaky CI
+
+# A deliberately flaky pipeline used to exercise the /retest command.
+# Each job fails roughly 50% of the time.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  flaky-a:
+    name: Flaky job A
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Coin flip
+        run: |
+          echo "run_attempt=${{ github.run_attempt }}"
+          if (( RANDOM % 2 == 0 )); then
+            echo "PASS"
+          else
+            echo "FLAKED"; exit 1
+          fi
+
+  flaky-b:
+    name: Flaky job B
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Coin flip
+        run: |
+          echo "run_attempt=${{ github.run_attempt }}"
+          if (( RANDOM % 2 == 0 )); then
+            echo "PASS"
+          else
+            echo "FLAKED"; exit 1
+          fi
+
+  always-green:
+    name: Always green
+    runs-on: ubuntu-22.04
+    steps:
+      - run: echo "this one never fails"
