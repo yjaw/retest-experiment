@@ -144,7 +144,11 @@ jobs:
                   summary.push(`- Buildkite: started new build [#${b.number}](${b.web_url})`);
                 } else {
                   const b = builds[0];
-                  const retryResp = await fetch(`${bkBase}/builds/${b.number}/retry_failed_jobs`, { method: 'POST', headers: bkHeaders });
+                  const retryResp = await fetch(`${bkBase}/builds/${b.number}/retry_failed_jobs`, {
+                    method: 'PUT',
+                    headers: { ...bkHeaders, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ states: 'failed,soft_failed' }),
+                  });
                   if (!retryResp.ok) throw new Error(`retry failed jobs HTTP ${retryResp.status}: ${await retryResp.text()}`);
                   const nb = await retryResp.json();
                   summary.push(`- Buildkite: retried failed jobs for [#${b.number}](${b.web_url}) -> [#${nb.number}](${nb.web_url})`);
