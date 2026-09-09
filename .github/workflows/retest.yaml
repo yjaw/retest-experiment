@@ -1,7 +1,7 @@
 name: Retest command
 
 # Re-run failed CI on a pull request by commenting:
-#   /retest       -> re-run only failed runs (GitHub Actions failed jobs + Buildkite rebuild)
+#   /retest       -> re-run only failed runs (GitHub Actions failed jobs + Buildkite retry_failed_jobs)
 #   /retest-all    -> re-run every run (all GitHub Actions jobs + fresh Buildkite build)
 #
 # NOTE: issue_comment workflows only execute from the copy of this file on the
@@ -144,10 +144,10 @@ jobs:
                   summary.push(`- Buildkite: started new build [#${b.number}](${b.web_url})`);
                 } else {
                   const b = builds[0];
-                  const rebuildResp = await fetch(`${bkBase}/builds/${b.number}/rebuild`, { method: 'PUT', headers: bkHeaders });
-                  if (!rebuildResp.ok) throw new Error(`rebuild HTTP ${rebuildResp.status}: ${await rebuildResp.text()}`);
-                  const nb = await rebuildResp.json();
-                  summary.push(`- Buildkite: rebuilt [#${b.number}](${b.web_url}) -> [#${nb.number}](${nb.web_url})`);
+                  const retryResp = await fetch(`${bkBase}/builds/${b.number}/retry_failed_jobs`, { method: 'POST', headers: bkHeaders });
+                  if (!retryResp.ok) throw new Error(`retry failed jobs HTTP ${retryResp.status}: ${await retryResp.text()}`);
+                  const nb = await retryResp.json();
+                  summary.push(`- Buildkite: retried failed jobs for [#${b.number}](${b.web_url}) -> [#${nb.number}](${nb.web_url})`);
                 }
               } catch (e) {
                 summary.push(`- Buildkite: failed to trigger (${e.message})`);

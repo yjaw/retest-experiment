@@ -18,7 +18,7 @@ before touching the real fork.
 Comment on a PR:
 
 - `/retest` — re-run only failed runs: GitHub Actions *failed jobs* of the latest
-  run per workflow, plus a Buildkite **rebuild** of the latest build for the commit.
+  run per workflow, plus a Buildkite **retry of failed jobs** for the latest build.
 - `/retest-all` — re-run everything: all GitHub Actions jobs, plus a **fresh**
   Buildkite build.
 

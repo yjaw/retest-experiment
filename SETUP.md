@@ -59,8 +59,8 @@ gh pr create --fill
   one job/step flakes red.
 - Comment `/retest` on the PR.
   - Expect: 🚀 reaction, then a summary comment listing which GHA workflows had
-    failed jobs re-run and the Buildkite rebuild link, then a 👍 reaction.
-  - Only the failed GHA jobs and a Buildkite rebuild should start.
+    failed jobs re-run and the Buildkite failed-job retry link, then a 👍 reaction.
+  - Only the failed GHA jobs and a Buildkite failed-job retry should start.
 - Comment `/retest-all` to confirm every job + a fresh Buildkite build start.
 - From a second account with no write access, comment `/retest` and confirm the
   😕 reaction + failed check.
