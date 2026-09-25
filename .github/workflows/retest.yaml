@@ -1,11 +1,11 @@
 name: Retest command
 
-# Re-run failed CI on a pull request by commenting:
-#   /retest       -> re-run only failed runs (GitHub Actions failed jobs + Buildkite retry_failed_jobs)
-#   /retest-all    -> re-run every run (all GitHub Actions jobs + fresh Buildkite build)
+# Re-run CI on a PR by commenting (PR author or users with write access only):
+#   /retest       -> re-run failed runs only (GitHub Actions failed jobs + Buildkite retry_failed_jobs)
+#   /retest-all   -> re-run everything (all GitHub Actions jobs + a Buildkite rebuild)
 #
-# NOTE: issue_comment workflows only execute from the copy of this file on the
-# repository's DEFAULT branch. Push this to `main` first, then test from PRs.
+# SECURITY: this workflow has secrets and write permissions. Never check out or
+# execute the PR's code here; only call APIs.
 
 on:
   issue_comment:
@@ -24,148 +24,180 @@ jobs:
   retest:
     name: Handle /retest
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
     if: >-
       github.event.issue.pull_request &&
       startsWith(github.event.comment.body, '/retest')
     steps:
       - name: Process retest command
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
-          # Who may run /retest. Comma separated: "author" (PR author),
-          # "write" (write/maintain/admin permission). Policy TBD with maintainers.
-          ALLOWED: "author,write"
-          # Buildkite: the Buildkite half no-ops when BUILDKITE_API_TOKEN is unset.
           BUILDKITE_API_TOKEN: ${{ secrets.BUILDKITE_API_TOKEN }}
           BUILDKITE_ORG: ${{ vars.BUILDKITE_ORG }}
           BUILDKITE_PIPELINE: ${{ vars.BUILDKITE_PIPELINE }}
         with:
           script: |
             const { owner, repo } = context.repo;
-            const issueNumber = context.payload.issue.number;
+            const prNumber = context.payload.issue.number;
             const commenter = context.payload.comment.user.login;
-            const body = (context.payload.comment.body || '').trim();
 
-            // ----- parse command (must be on its own line) -----
-            const cmdLine = body.split('\n').map(l => l.trim()).find(l => l.startsWith('/retest'));
-            const validCommands = ['/retest', '/retest-all'];
-            if (!validCommands.includes(cmdLine)) {
-              core.info(`No valid retest command (got: ${JSON.stringify(cmdLine)}), exiting.`);
+            // The job-level `if` guarantees the comment starts with /retest,
+            // so the command is always on the first line.
+            const command = context.payload.comment.body.trim().split('\n')[0].trim();
+            if (command !== '/retest' && command !== '/retest-all') {
+              core.info(`Not a retest command: ${JSON.stringify(command)}`);
               return;
             }
-            const retestAll = cmdLine === '/retest-all';
+            const retestAll = command === '/retest-all';
 
-            const react = (content) => github.rest.reactions.createForIssueComment({
-              owner, repo, comment_id: context.payload.comment.id, content,
-            }).catch(e => core.warning(`reaction failed: ${e.message}`));
+            try {
+              await retest();
+            } catch (e) {
+              await react('confused');
+              core.setFailed(`${command} failed: ${e.message}`);
+            }
 
-            // ----- permission check -----
-            const allowed = (process.env.ALLOWED || '').split(',').map(s => s.trim()).filter(Boolean);
-            const pr = (await github.rest.pulls.get({ owner, repo, pull_number: issueNumber })).data;
+            // ---------------------------------------------------------------
 
-            let permitted = allowed.includes('author') && pr.user.login === commenter;
-            if (!permitted && allowed.includes('write')) {
+            async function retest() {
+              const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+
+              if (pr.state !== 'open') {
+                await react('confused');
+                core.setFailed(`PR #${prNumber} is ${pr.merged ? 'merged' : 'closed'}; nothing to retest.`);
+                return;
+              }
+              if (!(await canRetest(pr, commenter))) {
+                await react('confused');
+                core.setFailed(`@${commenter} must be the PR author or have write access to run ${command}.`);
+                return;
+              }
+              await react('rocket');
+
+              const results = [
+                ...(await retestGitHubActions(pr.head.sha)),
+                await retestBuildkite(pr),
+              ];
+              await postSummary(pr.head.sha, results);
+              await react('+1');
+            }
+
+            async function canRetest(pr, user) {
+              if (pr.user.login === user) return true;
               try {
-                const perm = (await github.rest.repos.getCollaboratorPermissionLevel({
-                  owner, repo, username: commenter,
-                })).data.permission;
-                permitted = ['admin', 'write', 'maintain'].includes(perm);
+                const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username: user });
+                // `permission` is the legacy field, where maintain maps to write.
+                return ['admin', 'write'].includes(data.permission);
               } catch (e) {
-                core.info(`permission lookup failed for ${commenter}: ${e.message}`);
+                core.info(`Permission lookup failed for @${user}: ${e.message}`);
+                return false;
               }
             }
-            if (!permitted) {
-              await react('confused');
-              core.setFailed(`@${commenter} is not permitted to run ${cmdLine} (allowed: ${allowed.join(', ')}).`);
-              return;
+
+            // Re-runs the latest run of each workflow for the given commit.
+            async function retestGitHubActions(sha) {
+              const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
+                owner, repo, head_sha: sha, per_page: 100,
+              });
+
+              const latestByWorkflow = new Map();
+              for (const run of runs) {
+                if (run.name === context.workflow) continue; // don't re-run ourselves
+                const seen = latestByWorkflow.get(run.workflow_id);
+                if (!seen || run.run_number > seen.run_number) latestByWorkflow.set(run.workflow_id, run);
+              }
+              if (latestByWorkflow.size === 0) {
+                return ['- GHA: no workflow runs found for the PR head commit'];
+              }
+
+              const results = [];
+              for (const run of latestByWorkflow.values()) {
+                results.push(await retestRun(run));
+              }
+              return results;
             }
-            await react('rocket');
 
-            const headSha = pr.head.sha;
-            const headRef = pr.head.ref;
-            const summary = [];
+            async function retestRun(run) {
+              const FAILED = ['failure', 'cancelled', 'timed_out', 'startup_failure', 'stale'];
+              const label = `- GHA \`${run.name}\``;
 
-            // ===== GitHub Actions: latest run per workflow for the PR head commit =====
-            const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
-              owner, repo, head_sha: headSha, per_page: 100,
-            });
-            const latestByWorkflow = new Map();
-            for (const run of runs) {
-              if (run.name === context.workflow) continue; // don't re-run ourselves
-              const prev = latestByWorkflow.get(run.workflow_id);
-              if (!prev || run.run_number > prev.run_number) latestByWorkflow.set(run.workflow_id, run);
-            }
-
-            const failedConclusions = ['failure', 'cancelled', 'timed_out', 'startup_failure', 'stale', 'action_required'];
-            for (const run of latestByWorkflow.values()) {
-              const isFailed = failedConclusions.includes(run.conclusion);
-              if (!retestAll && !isFailed) {
-                summary.push(`- GHA \`${run.name}\`: skipped (conclusion: ${run.conclusion})`);
-                continue;
+              // Re-running would bypass the approval gate for new contributors.
+              if (run.conclusion === 'action_required') {
+                return `${label}: skipped (awaiting maintainer approval)`;
+              }
+              if (run.status !== 'completed') {
+                return `${label}: skipped (still ${run.status})`;
+              }
+              if (!retestAll && !FAILED.includes(run.conclusion)) {
+                return `${label}: skipped (${run.conclusion})`;
               }
               try {
                 if (retestAll) {
                   await github.rest.actions.reRunWorkflow({ owner, repo, run_id: run.id });
-                  summary.push(`- GHA \`${run.name}\`: re-running all jobs`);
-                } else {
-                  await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: run.id });
-                  summary.push(`- GHA \`${run.name}\`: re-running failed jobs`);
+                  return `${label}: re-running all jobs`;
                 }
+                await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: run.id });
+                return `${label}: re-running failed jobs`;
               } catch (e) {
-                summary.push(`- GHA \`${run.name}\`: failed to trigger (${e.message})`);
+                return `${label}: failed to trigger (${e.message})`;
               }
             }
-            if (latestByWorkflow.size === 0) {
-              summary.push('- GHA: no workflow runs found for the PR head commit');
-            }
 
-            // ===== Buildkite =====
-            const bkToken = process.env.BUILDKITE_API_TOKEN;
-            const bkOrg = process.env.BUILDKITE_ORG;
-            const bkPipeline = process.env.BUILDKITE_PIPELINE;
-            if (!bkToken || !bkOrg || !bkPipeline) {
-              summary.push('- Buildkite: skipped (BUILDKITE_API_TOKEN / BUILDKITE_ORG / BUILDKITE_PIPELINE not all set)');
-            } else {
-              const bkBase = `https://api.buildkite.com/v2/organizations/${bkOrg}/pipelines/${bkPipeline}`;
-              const bkHeaders = { Authorization: `Bearer ${bkToken}`, 'Content-Type': 'application/json' };
+            async function retestBuildkite(pr) {
+              if (!process.env.BUILDKITE_API_TOKEN) {
+                return '- Buildkite: skipped (BUILDKITE_API_TOKEN not set)';
+              }
               try {
-                const listResp = await fetch(`${bkBase}/builds?commit=${headSha}&per_page=1`, { headers: bkHeaders });
-                if (!listResp.ok) throw new Error(`list builds HTTP ${listResp.status}`);
-                const builds = await listResp.json();
-                if (retestAll || builds.length === 0) {
-                  const createResp = await fetch(`${bkBase}/builds`, {
-                    method: 'POST', headers: bkHeaders,
-                    body: JSON.stringify({
-                      commit: headSha, branch: headRef,
-                      message: `:repeat: ${cmdLine} by @${commenter} (PR #${issueNumber})`,
-                    }),
-                  });
-                  if (!createResp.ok) throw new Error(`create build HTTP ${createResp.status}: ${await createResp.text()}`);
-                  const b = await createResp.json();
-                  summary.push(`- Buildkite: started new build [#${b.number}](${b.web_url})`);
-                } else {
-                  const b = builds[0];
-                  const retryResp = await fetch(`${bkBase}/builds/${b.number}/retry_failed_jobs`, {
-                    method: 'PUT',
-                    headers: { ...bkHeaders, 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ states: 'failed,soft_failed' }),
-                  });
-                  if (!retryResp.ok) throw new Error(`retry failed jobs HTTP ${retryResp.status}: ${await retryResp.text()}`);
-                  const nb = await retryResp.json();
-                  summary.push(`- Buildkite: retried failed jobs for [#${b.number}](${b.web_url}) -> [#${nb.number}](${nb.web_url})`);
+                const [latest] = await buildkite('GET', `/builds?commit=${pr.head.sha}&per_page=1`);
+                // Only re-run builds Buildkite itself created from the webhook. Creating one
+                // here would skip its fork checks and let the PR pick any branch name.
+                if (!latest) {
+                  return '- Buildkite: skipped (no build found for this commit)';
                 }
+                const link = `[#${latest.number}](${latest.web_url})`;
+                if (retestAll) {
+                  const build = await buildkite('PUT', `/builds/${latest.number}/rebuild`);
+                  return `- Buildkite: rebuilt ${link} as [#${build.number}](${build.web_url})`;
+                }
+                if (!['failed', 'canceled'].includes(latest.state)) {
+                  return `- Buildkite: skipped ${link} (${latest.state})`;
+                }
+                // Retrying jobs happens inside the same build; no new build is created.
+                await buildkite('PUT', `/builds/${latest.number}/retry_failed_jobs`, {
+                  states: 'failed,soft_failed,canceled,timed_out',
+                });
+                return `- Buildkite: retrying failed jobs in ${link}`;
               } catch (e) {
-                summary.push(`- Buildkite: failed to trigger (${e.message})`);
+                return `- Buildkite: failed to trigger (${e.message})`;
               }
             }
 
-            // ===== report =====
-            const mode = retestAll ? '`/retest-all` (all runs)' : '`/retest` (failed runs only)';
-            const comment = [
-              `### Retest triggered by @${commenter}`,
-              ``,
-              `Mode: ${mode} on commit \`${headSha.slice(0, 7)}\``,
-              ``,
-              ...summary,
-            ].join('\n');
-            await github.rest.issues.createComment({ owner, repo, issue_number: issueNumber, body: comment });
-            await react('+1');
+            async function buildkite(method, path, body) {
+              const { BUILDKITE_API_TOKEN, BUILDKITE_ORG, BUILDKITE_PIPELINE } = process.env;
+              const url = `https://api.buildkite.com/v2/organizations/${BUILDKITE_ORG}/pipelines/${BUILDKITE_PIPELINE}${path}`;
+              const resp = await fetch(url, {
+                method,
+                headers: { Authorization: `Bearer ${BUILDKITE_API_TOKEN}`, 'Content-Type': 'application/json' },
+                body: body && JSON.stringify(body),
+              });
+              if (!resp.ok) throw new Error(`${method} ${path} -> HTTP ${resp.status}: ${await resp.text()}`);
+              return resp.json();
+            }
+
+            async function postSummary(sha, results) {
+              const mode = retestAll ? 'all runs' : 'failed runs only';
+              const body = [
+                `### Retest triggered by @${commenter}`,
+                '',
+                `Mode: \`${command}\` (${mode}) on commit \`${sha.slice(0, 7)}\``,
+                '',
+                ...results,
+              ].join('\n');
+              await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
+            }
+
+            function react(content) {
+              return github.rest.reactions.createForIssueComment({
+                owner, repo, comment_id: context.payload.comment.id, content,
+              }).catch(e => core.warning(`Failed to add reaction: ${e.message}`));
+            }
