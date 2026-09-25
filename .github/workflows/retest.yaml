@@ -180,7 +180,7 @@ jobs:
                 headers: { Authorization: `Bearer ${BUILDKITE_API_TOKEN}`, 'Content-Type': 'application/json' },
                 body: body && JSON.stringify(body),
               });
-              if (!resp.ok) throw new Error(`${method} ${path} -> HTTP ${resp.status}: ${await resp.text()}`);
+              if (!resp.ok) throw new Error(`${method} ${path} -> HTTP ${resp.status}: ${(await resp.text()).trim()}`);
               return resp.json();
             }
 
